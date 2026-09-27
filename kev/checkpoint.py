@@ -115,6 +115,9 @@ class LoadOptions:
     fused        rewrite a merged hybrid backbone on CUDA with fused Triton kernels (kev.fused_qwen35; needs
                  flash-linear-attention fused_qwen35.FLA_VERSION and refuses any other). None = off; kev.serve turns it on
                  for CUDA when fused_available() (KEV_FUSED=0 to decline). Equal to the reference layers up to bf16 rounding.
+    quantize     "int8" (bitsandbytes LLM.int8) or "nf4" (4-bit NF4, double quantization, compute in `dtype`): the merged
+                 backbone's Linear layers are quantized as they move to the GPU; embeddings and the pointer head are not.
+                 LoRA checkpoints only; turns the fused kernels off (they read raw weight tensors). None = off.
     """
     dtype: torch.dtype | None = None
     merge: bool = True
@@ -124,24 +127,50 @@ class LoadOptions:
     backend: str | None = None
     cuda_graphs: bool | None = None
     fused: bool | None = None
+    quantize: str | None = None
 
     BACKENDS = (None, "torch", "mlx", "auto")
 
     @classmethod
     def from_env(cls, env=os.environ):
         """KEV_DTYPE=bf16|fp16|fp32, KEV_MERGE=0, KEV_ATTN=sdpa|eager, KEV_LORA_SCALE, KEV_TEMPERATURE, KEV_BACKEND=torch|mlx|auto,
-        KEV_CUDA_GRAPHS=0|1, KEV_FUSED=0|1.
+        KEV_CUDA_GRAPHS=0|1, KEV_FUSED=0|1, KEV_LOAD_IN_8BIT=1, KEV_LOAD_IN_4BIT=1.
         For command-line entry points only; library code passes an explicit LoadOptions. Explicit values that equal a
         library default are kept (fp32 as torch.float32, "torch" as a string) so a caller with its own default, like
         kev.serve, can tell "asked for it" from "did not say"."""
         backend = env.get("KEV_BACKEND") or None
         if backend not in cls.BACKENDS: raise ValueError(f"KEV_BACKEND must be one of torch, mlx, auto; got {backend!r}")
+        int8, nf4 = env.get("KEV_LOAD_IN_8BIT") == "1", env.get("KEV_LOAD_IN_4BIT") == "1"
+        if int8 and nf4: raise ValueError("set at most one of KEV_LOAD_IN_8BIT and KEV_LOAD_IN_4BIT")
         return cls(dtype={"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}.get(env.get("KEV_DTYPE", "")),
                    merge=env.get("KEV_MERGE", "1") != "0", attn=env.get("KEV_ATTN") or None,
                    lora_scale=float(env.get("KEV_LORA_SCALE", "1")),
                    temperature=float(env["KEV_TEMPERATURE"]) if env.get("KEV_TEMPERATURE") else None, backend=backend,
                    cuda_graphs={"0": False, "1": True}.get(env.get("KEV_CUDA_GRAPHS", "")),
-                   fused={"0": False, "1": True}.get(env.get("KEV_FUSED", "")))
+                   fused={"0": False, "1": True}.get(env.get("KEV_FUSED", "")),
+                   quantize="int8" if int8 else "nf4" if nf4 else None)
+
+
+def quantize_linears(module, mode, compute_dtype):
+    """Replace every nn.Linear under `module` with its bitsandbytes counterpart, in place. The weights are quantized when
+    the module moves to CUDA. mode: "int8" (LLM.int8, outlier threshold 6.0) or "nf4" (NF4 with double quantization)."""
+    import bitsandbytes as bnb
+    for name, child in module.named_children():
+        if isinstance(child, torch.nn.Linear):
+            bias = child.bias is not None
+            if mode == "int8":
+                q = bnb.nn.Linear8bitLt(child.in_features, child.out_features, bias=bias, has_fp16_weights=False, threshold=6.0)
+                q.weight = bnb.nn.Int8Params(child.weight.data, requires_grad=False, has_fp16_weights=False)
+            elif mode == "nf4":
+                q = bnb.nn.Linear4bit(child.in_features, child.out_features, bias=bias, compute_dtype=compute_dtype,
+                                      quant_type="nf4", compress_statistics=True)
+                q.weight = bnb.nn.Params4bit(child.weight.data, requires_grad=False, quant_type="nf4", compress_statistics=True)
+            else:
+                raise ValueError(f"quantize must be int8 or nf4, got {mode!r}")
+            if bias: q.bias = torch.nn.Parameter(child.bias.data, requires_grad=False)
+            setattr(module, name, q)
+        else:
+            quantize_linears(child, mode, compute_dtype)
 
 
 def mlx_available():
@@ -245,7 +274,7 @@ class Checkpoint:
     def _load_torch(self, tok, device, opts):
         m, merged = self._full_torch(tok, device, opts) if self.full else self._adapted_torch(tok, device, opts)
         serving = str(device).startswith("cuda") and m.hybrid
-        if opts.fused and serving and merged:   # fused projections need plain (merged or full) weights
+        if opts.fused and serving and merged and not opts.quantize:   # fused projections need plain (merged or full) weights
             from .fused_qwen35 import fuse
             fuse(m.lm)
         if opts.cuda_graphs and serving:
@@ -274,15 +303,21 @@ class Checkpoint:
         from peft import PeftModel
         meta = self.meta
         dtype, merge = opts.dtype or torch.float32, opts.merge
+        if opts.quantize:
+            if self.full or not merge: raise ValueError("quantized loading folds a LoRA adapter first: LoRA checkpoints with KEV_MERGE=1 only")
+            if not str(device).startswith("cuda"): raise ValueError("quantized loading (bitsandbytes) needs a CUDA device")
+            if dtype == torch.float32: dtype = torch.bfloat16
         if meta.weights_dtype == "bf16":
             # trained with a bf16 backbone (--weights_dtype bf16: Kev-27B, the 35B-A3B MoE whose fused experts need bf16):
             # load it the same way. The exact path keeps the fp32 adapter unmerged; the fused serving path folds it in
             # (one rounding of W + delta, as for every served Kev; parity in runs/serving-27b-*).
             dtype, merge = torch.bfloat16, merge and bool(opts.fused)
         merge = merge and not self.adapter_config().get("trainable_token_indices")   # token-trained adapters stay unmerged
-        m = DecisionModel(meta.base, tok, device, lora=None, revision=meta.base_revision, head_dim=meta.head_dim,
-                          option_isolation=meta.option_isolation, dtype=dtype, attn=opts.attn)
-        m.lm = PeftModel.from_pretrained(m.lm, self.path, torch_device=str(device)).to(device)   # trainable token embeddings, if any, live in the adapter
+        stage = "cpu" if opts.quantize else device   # quantized: merge in host memory, so the GPU never holds the bf16 backbone
+        attn = opts.attn or ("sdpa" if str(device).startswith("cuda") else None)   # chosen for the serving device, not the CPU stage
+        m = DecisionModel(meta.base, tok, stage, lora=None, revision=meta.base_revision, head_dim=meta.head_dim,
+                          option_isolation=meta.option_isolation, dtype=dtype, attn=attn)
+        m.lm = PeftModel.from_pretrained(m.lm, self.path, torch_device=str(stage)).to(stage)   # trainable token embeddings, if any, live in the adapter
         if opts.lora_scale != 1:
             for module in m.lm.modules():
                 if isinstance(getattr(module, "scaling", None), dict):
@@ -290,6 +325,9 @@ class Checkpoint:
             m.lora_scale = opts.lora_scale
         if merge: m.lm = m.lm.merge_and_unload()     # W += delta: fp32 math, one rounding (see LoadOptions.merge)
         if dtype != torch.float32: m.lm = m.lm.to(dtype)
+        if opts.quantize:
+            quantize_linears(m.lm, opts.quantize, dtype)
+            m.to(device); m.device = device
         return m, merge
 
     COMPAT_FIELDS = ("base", "base_revision", "lora", "head_dim", "option_isolation", "special_embeddings", "weights")

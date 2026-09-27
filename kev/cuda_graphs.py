@@ -34,6 +34,7 @@ same buffers and the bucket joins `pending`; capture_pending() captures them lat
 waiting). Replays run one at a time (kev.serve has one model thread), each refills what it reads, and its results are
 copied out before the next replay; that is what makes the shared buffers and the shared memory pool safe.
 """
+import os
 from collections import OrderedDict
 from typing import NamedTuple
 
@@ -42,18 +43,21 @@ from transformers import DynamicCache
 from transformers.cache_utils import DynamicLayer, LinearAttentionLayer
 
 # Limits of the graphed passes (not the model's context: that is kev.model.MAX_STATE / SERVE_MAX_STATE)
-GRAPH_TOKENS = 32768   # rows x positions one row pass may hold in the attention buffers (about 1 GB on Kev-4B and 9B)
+GRAPH_TOKENS = int(os.environ.get("KEV_GRAPH_ROWS", "32768"))   # rows x positions one row pass may hold in the attention buffers (about 1 GB on Kev-4B and 9B)
 GRAPH_STATE = 1024     # longest state bucket the state pass graphs. A longer state pass is compute-bound, and the padding plus
                        # the explicit mask (no causal flash attention) made a 2,200-token one slower as a graph (L40S, Kev-4B:
                        # 223 vs 208 ms per request), so it runs eagerly
 GRAPH_ROW = 1024       # longest question-row bucket the row pass graphs
 GRAPH_ROWS = 32        # question rows per graphed pass; more run as several replays
-GRAPH_STATES = 16      # states per state pass: the bank's entries
-BANK_WIDTH = 4096      # positions per bank entry (states are right-aligned in it; about 2 GB for 16 entries on Kev-4B and 9B)
+# KEV_GRAPH_STATE_BANK=<entries>x<width>: states per state pass (the bank's entries) and positions per entry (states are
+# right-aligned in it; about 2 GB for 16x4096 on Kev-4B and 9B). Smaller banks fit small GPUs; longer states run eagerly.
+GRAPH_STATES, BANK_WIDTH = (int(n) for n in os.environ.get("KEV_GRAPH_STATE_BANK", "16x4096").lower().split("x"))
 GRAPHS_KEPT = 256      # captured graphs kept, least recently used evicted (a busy server met ~160 on mixed traffic)
 PASS_TOKENS = 256      # tokens a pass costs however few it holds: below about this many, a pass is bound by reading the
                        # weights, not by compute (bf16 GEMMs: peak FLOP/s over memory bandwidth is ~200-400 on H100, H200, B200, L40S)
 HOT_BUCKET = 3         # eager passes after which a busy server captures a bucket's graph anyway (capture_due)
+if GRAPH_TOKENS < BANK_WIDTH + GRAPH_ROW:
+    raise ValueError(f"KEV_GRAPH_ROWS={GRAPH_TOKENS} must hold a full bank entry plus a row ({BANK_WIDTH + GRAPH_ROW} tokens)")
 
 
 def bucket(n, steps=8, floor=16):

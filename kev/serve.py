@@ -28,7 +28,8 @@ PREFIX_MAX_TOKENS = int(os.environ.get("KEV_PREFIX_MAX_TOKENS", "65536"))  # sta
                                                                          # One 64k state (Kev-27B: ~1.3 GB of keys, values and DeltaNet states), or four 16k ones, not four 64k ones
 DATE_FACTS = os.environ.get("KEV_DATE_FACTS", "0") == "1"
 API_KEY = os.environ.get("KEV_API_KEY")                                  # unset = open server; set = require Authorization: Bearer <key>, as the TypeSafe clients always send
-MAX_BATCH = 64                                                           # requests the model thread takes at once (kev.cuda_graphs splits them to fit its buffers)
+MAX_BATCH = int(os.environ.get("KEV_MAX_BATCH", "64"))                   # requests the model thread takes at once (kev.cuda_graphs splits them to fit its buffers)
+MAX_STATE = int(os.environ.get("KEV_SERVE_MAX_STATE", SERVE_MAX_STATE))   # state tokens a request keeps; lower it on small GPUs (longer states are truncated, as encode() does)
 MODEL_NAMES = ("kev-latest", "jev-latest")                               # both names serve this checkpoint; jev-latest is the TypeSafe SDK default model, so an unconfigured client works
 
 
@@ -113,7 +114,7 @@ class Server:
         first question) is cached across requests, so a repeated state only pays for its question rows. latency_ms is the
         model time of the batch the request ran in (not its wait in the queue)."""
         if self.stopping.is_set(): raise HTTPException(503, "the server is stopping")
-        try: enc = self.model.encode(self.tok, rec, max_state=SERVE_MAX_STATE, max_branch=SERVE_MAX_BRANCH)
+        try: enc = self.model.encode(self.tok, rec, max_state=MAX_STATE, max_branch=SERVE_MAX_BRANCH)
         except ValueError as e: raise HTTPException(422, str(e))
         done = Future()
         self.queue.put((enc, done))
@@ -286,6 +287,7 @@ def main():
     if opts.backend is None: opts = replace(opts, backend="auto")   # serving default: MLX for the hybrid Qwen3.5 checkpoints on Apple Silicon (LoadOptions.backend); KEV_BACKEND=torch to decline
     ck = Checkpoint(run)
     tok, model = ck.load(dev, opts)
+    empty_cache(dev)   # merging and fusing leave freed copies in the allocator's pool (~5 GB on Kev-4B); hand them back
     if fused_default and not opts.fused and model.hybrid: print("fused Qwen3.5 kernels off: install the flash-linear-attention version kev/fused_qwen35.py pins (FLA_VERSION) to turn them on")
     app.state.server = Server(ck, tok, model, dev)
     print(f"serving {ck.requested} ({ck.path}) on {dev} via {model.backend} ({model.dtype}) {a.host}:{a.port}")   # /v1/models reports the run as given, not the resolved cache path
