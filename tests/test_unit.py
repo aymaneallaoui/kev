@@ -2557,20 +2557,36 @@ def test_run_provenance_hashes_data_and_records_rejections(tmp_path, monkeypatch
     import hashlib
     from kev import provenance
     data = tmp_path / "train.jsonl"; data.write_text('{"x": 1}\n', encoding="utf-8")
-    monkeypatch.setenv("KEV_GIT_COMMIT", "c" * 40)
+    monkeypatch.setattr(provenance, "code_commit", lambda: {"commit": "c" * 40, "dirty": False})
     a = SimpleNamespace(base=str(tmp_path), data=str(data), val_data="", seed=7)
     init = {"init_from": "org/kev", "resolved": str(tmp_path / "snapshots" / ("d" * 40)), "weights_sha256": "w", "head_sha256": "h", "tensors": 2}
     p = provenance.run_provenance(a, "cpu", 1, None, init, {"train": {"state": 2}}, "t0", "t1")
-    assert p["kev"] == {"commit": "c" * 40, "dirty": None}
+    assert p["kev"] == {"commit": "c" * 40, "dirty": False}
     assert p["data"]["data"] == {"path": str(data.resolve()), "bytes": 9, "sha256": hashlib.sha256(b'{"x": 1}\n').hexdigest()}
     assert p["data"]["val_data"] is None and p["init"]["revision"] == "d" * 40 and p["init"]["weights_sha256"] == "w"
     assert p["base"]["revision"] is None and p["base"]["unresolved"] and p["seed"] == 7
     assert p["rejected_records"] == {"train": {"state": 2}} and (p["started"], p["ended"]) == ("t0", "t1")
     assert p["device"] == {"type": "cpu", "name": None, "world_size": 1} and set(p["versions"]) == {"python", "torch", "transformers", "peft"}
-    monkeypatch.delenv("KEV_GIT_COMMIT")
-    commit = provenance.code_commit()
-    assert commit["commit"] is None or (len(commit["commit"]) == 40 and isinstance(commit["dirty"], bool))
-    assert provenance.code_commit(tmp_path) == {"commit": None, "dirty": None}
+
+
+def test_code_commit_prefers_the_checkout_and_sees_untracked_package_files(tmp_path, monkeypatch):
+    import subprocess
+    from kev.provenance import code_commit
+    git = lambda *args: subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *args], cwd=tmp_path, check=True, capture_output=True, text=True).stdout.strip()
+    package = tmp_path / "kev"; package.mkdir(); (package / "a.py").write_text("x = 1\n", encoding="utf-8")
+    (tmp_path / "other").mkdir()
+    monkeypatch.delenv("KEV_GIT_COMMIT", raising=False)
+    assert code_commit(package) == {"commit": None, "dirty": None}
+    monkeypatch.setenv("KEV_GIT_COMMIT", "c" * 40)
+    assert code_commit(package) == {"commit": "c" * 40, "dirty": None}                  # no checkout: the container's variable
+    git("init", "-q"); git("add", "."); git("commit", "-qm", "init"); head = git("rev-parse", "HEAD")
+    assert code_commit(package) == {"commit": head, "dirty": False}                     # the checkout wins over the variable
+    (tmp_path / "other" / "notes.txt").write_text("n", encoding="utf-8")
+    assert code_commit(package)["dirty"] is False                                       # untracked outside the package
+    (package / "new.py").write_text("y = 2\n", encoding="utf-8")
+    assert code_commit(package)["dirty"] is True
+    (package / "new.py").unlink(); (package / "a.py").write_text("x = 3\n", encoding="utf-8")
+    assert code_commit(package)["dirty"] is True
 
 
 def test_validation_scores_records_without_augmentation_and_restores_train_mode(tmp_path):

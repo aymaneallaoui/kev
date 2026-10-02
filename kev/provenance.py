@@ -11,16 +11,15 @@ PACKAGE = Path(__file__).resolve().parent
 
 
 def code_commit(root=PACKAGE):
-    """{"commit", "dirty"} of the checkout kev runs from; dirty counts tracked files only. Inside a container without .git,
-    KEV_GIT_COMMIT (as kev.experiment.git_commit) with dirty unknown; both None outside a git checkout."""
-    if os.environ.get("KEV_GIT_COMMIT"):
-        return {"commit": os.environ["KEV_GIT_COMMIT"], "dirty": None}
+    """{"commit", "dirty"} of the checkout kev runs from; dirty counts changed tracked files anywhere and untracked files
+    under the package. Without a git checkout (a container), KEV_GIT_COMMIT with dirty unknown, else both None."""
     try:
         commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True, stderr=subprocess.DEVNULL).strip()
-        status = subprocess.check_output(["git", "status", "--porcelain", "--untracked-files=no"], cwd=root, text=True, stderr=subprocess.DEVNULL)
+        tracked = subprocess.check_output(["git", "status", "--porcelain", "--untracked-files=no"], cwd=root, text=True, stderr=subprocess.DEVNULL)
+        untracked = subprocess.check_output(["git", "status", "--porcelain", "--untracked-files=all", "--", "."], cwd=root, text=True, stderr=subprocess.DEVNULL)
     except (subprocess.CalledProcessError, OSError):
-        return {"commit": None, "dirty": None}
-    return {"commit": commit, "dirty": bool(status.strip())}
+        return {"commit": os.environ.get("KEV_GIT_COMMIT") or None, "dirty": None}
+    return {"commit": commit, "dirty": bool(tracked.strip() or untracked.strip())}
 
 
 def file_record(path):
