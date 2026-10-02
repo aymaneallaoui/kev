@@ -1457,7 +1457,7 @@ def test_snapshots_are_checkpoints_kept_and_completed_on_resume(tiny_base, tmp_p
     assert completed_snapshots(whole) == [2, 4] and sorted(p.name for p in whole.iterdir()) == ["step-0000002", "step-0000004"]
     for step, epoch in ((2, 0.5), (4, 1.0)):
         snap = snapshot_path(whole, step)
-        final_files = {p.name for p in (tmp_path / "whole").iterdir()} - {"training_metrics.json", "training_config.json"}
+        final_files = {p.name for p in (tmp_path / "whole").iterdir()} - {"training_metrics.json", "training_config.json", "provenance.json"}
         assert {p.name for p in snap.iterdir()} == final_files | {SNAPSHOT_INFO}
         meta = read_meta(snap)
         assert meta.extra["snapshot"] == {"step": step, "steps": 8, "epoch": epoch, "records_seen": 4 * step} and (meta.weights, meta.lora) == ("full", 0)
@@ -2511,3 +2511,63 @@ def test_release_date_skips_zeroed_mtimes_and_uses_utc(tmp_path, monkeypatch):
     assert ck.release_date() == "2026-09-29" and calls == [("jaredpalmer/kev-x", "v1.0")]
     ck.requested = "down/kev"
     assert ck.release_date() == "unknown"                                      # offline: the cached files' rule
+
+
+def _write_records(path, records):
+    import json
+    path.write_text("".join(json.dumps(r) + "\n" for r in records), encoding="utf-8")
+    from kev.data import load_records
+    return load_records(path)
+
+
+def _choice(instructions, label="a"):
+    return {"type": "choice", "instructions": instructions, "criteria": {"a": "first", "b": "second"}, "label": label}
+
+
+def test_context_filter_counts_rejected_records_by_reason(tok, tmp_path):
+    from kev.model import MAX_STATE
+    from kev.train import context_filter
+    reqs = _write_records(tmp_path / "d.jsonl", [
+        {"state": "short page", "questions": {"op": _choice("Pick one.")}},
+        {"state": "word " * 1000, "questions": {"op": _choice("Pick one.")}},                       # state over 384 tokens
+        {"state": "short", "questions": {"op": _choice("word " * 1100)}},                          # one row over 1024
+        {"state": "short", "questions": {f"q{i}": _choice("word " * 700) for i in range(3)}},     # rows fit, packed over 2048
+    ])
+    kept, rejected = context_filter(reqs, tok, MAX_STATE)
+    assert [r["_meta"]["id"] for r in kept] == ["custom/0"] and rejected == {"state": 1, "branch": 1, "packed": 1}
+    assert context_filter(reqs[:1], tok, MAX_STATE) == (reqs[:1], {})
+
+
+def test_resolved_revision_reads_only_the_local_cache(tmp_path):
+    from kev.provenance import resolved_revision
+    sha, other = "a" * 40, "b" * 40
+    root = tmp_path / "models--org--base"
+    (root / "refs").mkdir(parents=True); (root / "refs" / "main").write_text(sha + "\n", encoding="utf-8")
+    (root / "snapshots" / sha).mkdir(parents=True); (root / "snapshots" / other).mkdir()
+    assert resolved_revision("org/base", None, cache=tmp_path) == (sha, None)
+    assert resolved_revision("org/base", other, cache=tmp_path) == (other, None)            # a full sha as given
+    assert resolved_revision("org/base", "bbbb", cache=tmp_path) == (other, None)           # a short sha, one snapshot
+    assert resolved_revision("org/base", "v2", cache=tmp_path)[0] is None
+    assert resolved_revision("org/missing", None, cache=tmp_path)[1].startswith("revision main of org/missing")
+    assert resolved_revision(str(tmp_path), None, cache=tmp_path) == (None, "a local directory, not a Hub repo")
+
+
+def test_run_provenance_hashes_data_and_records_rejections(tmp_path, monkeypatch):
+    import hashlib
+    from kev import provenance
+    data = tmp_path / "train.jsonl"; data.write_text('{"x": 1}\n', encoding="utf-8")
+    monkeypatch.setenv("KEV_GIT_COMMIT", "c" * 40)
+    a = SimpleNamespace(base=str(tmp_path), data=str(data), seed=7)
+    init = {"init_from": "org/kev", "resolved": str(tmp_path / "snapshots" / ("d" * 40)), "weights_sha256": "w", "head_sha256": "h", "tensors": 2}
+    p = provenance.run_provenance(a, "cpu", 1, None, init, {"train": {"state": 2}}, "t0", "t1")
+    assert p["kev"] == {"commit": "c" * 40, "dirty": None}
+    assert p["data"]["data"] == {"path": str(data.resolve()), "bytes": 9, "sha256": hashlib.sha256(b'{"x": 1}\n').hexdigest()}
+    assert p["data"] == {"data": p["data"]["data"]} and p["init"]["revision"] == "d" * 40 and p["init"]["weights_sha256"] == "w"
+    assert p["base"]["revision"] is None and p["base"]["unresolved"] and p["seed"] == 7
+    assert p["rejected_records"] == {"train": {"state": 2}} and (p["started"], p["ended"]) == ("t0", "t1")
+    assert p["device"] == {"type": "cpu", "name": None, "world_size": 1} and set(p["versions"]) == {"python", "torch", "transformers", "peft"}
+    monkeypatch.delenv("KEV_GIT_COMMIT")
+    commit = provenance.code_commit()
+    assert commit["commit"] is None or (len(commit["commit"]) == 40 and isinstance(commit["dirty"], bool))
+    assert provenance.code_commit(tmp_path) == {"commit": None, "dirty": None}
+

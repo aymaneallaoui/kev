@@ -28,3 +28,8 @@ def allocated_bytes(device):
     if device == "mps": return torch.mps.current_allocated_memory()
     if device == "cuda": return torch.cuda.max_memory_allocated()
     return 0
+
+
+def device_name(device):
+    """The accelerator's model name (CUDA), else None."""
+    return torch.cuda.get_device_name() if device == "cuda" and torch.cuda.is_available() else None

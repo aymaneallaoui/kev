@@ -16,12 +16,12 @@ from dataclasses import dataclass
 from pathlib import Path
 import torch
 import torch.nn.functional as F
-from . import full_ft
+from . import full_ft, provenance
 from .checkpoint import Checkpoint, Meta, write_meta
 from .device import allocated_bytes, default_device, empty_cache, sync
 from .data import EVAL_ONLY, build, augment, load_records, materialize, none_pair, source_seed
 from .suite import SYNTHETIC_SOURCES, digest, load_split, read_json, read_manifest, validate_training, write_json
-from .model import MAX_STATE, MAX_TRAIN_STATE, DecisionModel, fits, load_tokenizer, rows_of, training_context, user_tokens
+from .model import MAX_STATE, MAX_TRAIN_STATE, DecisionModel, context_rejection, load_tokenizer, rows_of, training_context, user_tokens
 
 
 # --- losses -----------------------------------------------------------------------------------------------------------
@@ -83,10 +83,21 @@ def accumulation_records(n, batch, accum, microbatch):
 
 # --- data -------------------------------------------------------------------------------------------------------------
 
+def context_filter(reqs, tok, max_state):
+    """(the records that encode strictly within the training context, {reason: count} of the others; kev.model.context_rejection)."""
+    c, kept, rejected = training_context(max_state), [], Counter()
+    for r in reqs:
+        reason = context_rejection(materialize(r), tok, **c)
+        if reason: rejected[reason] += 1
+        else: kept.append(r)
+    return kept, dict(rejected)
+
+
 def training_requests(a, tok, manifest, holdout):
-    """The labelled requests one run trains on: the suite's training partition, records built from the public sources,
-    or the user's own file (optionally with a replay sample from the suite); filtered to the training context, checked
-    against the eval-only policy, then the ablation knobs (--train_sources, --public_frac, --synthetic_repeat)."""
+    """(the labelled requests one run trains on, {reason: count} of those the context filter rejected): the suite's
+    training partition, records built from the public sources, or the user's own file (optionally with a replay sample
+    from the suite); filtered to the training context, checked against the eval-only policy, then the ablation knobs
+    (--train_sources, --public_frac, --synthetic_repeat)."""
     # the suite's rules (declared trainable sources, no held-out structures) apply to every record taken from it
     if a.data:
         reqs = load_records(a.data)
@@ -99,14 +110,15 @@ def training_requests(a, tok, manifest, holdout):
         reqs = load_split(a.suite, "train"); validate_training(reqs, manifest)
     else:
         reqs = build(a.n_per_source, "train", a.seed, exclude=holdout)
+    rejected = {}
     if not manifest or a.data:
         # frozen suites are filtered to the training context when they are frozen (kev.suite.select_unique); records built
         # on the fly here are not, so apply the same rule instead of letting the strict encoder abort the run (issue #5)
-        kept = [r for r in reqs if fits(materialize(r), tok, **training_context(a.max_state))]
+        kept, rejected = context_filter(reqs, tok, a.max_state)
         if len(kept) < len(reqs):
             c = training_context(a.max_state)
             print(f"dropped {len(reqs) - len(kept)} of {len(reqs)} records that exceed the training context "
-                  f"({c['max_state']} state / {c['max_branch']} branch / {c['max_packed']} packed tokens)", flush=True)
+                  f"({c['max_state']} state / {c['max_branch']} branch / {c['max_packed']} packed tokens): {rejected}", flush=True)
         reqs = kept
     if not reqs:
         raise ValueError("empty training set")
@@ -130,7 +142,7 @@ def training_requests(a, tok, manifest, holdout):
         extra = [r for r in reqs if r["_meta"]["source"] in SYNTHETIC_SOURCES] * (a.synthetic_repeat - 1)
         reqs = reqs + extra
         print(f"mix: synthetic_repeat {a.synthetic_repeat} -> +{len(extra)} records", flush=True)
-    return reqs
+    return reqs, rejected
 
 
 @dataclass(eq=False)   # identity, so batch.index(v) finds this very variant
@@ -522,6 +534,7 @@ def pinned_revision(a, manifest):
 
 def main():
     a = parse_args()
+    run_started = provenance.now()
     dev = a.device or default_device()
     rank, world = full_ft.init_distributed(dev) if a.full_ft else (0, 1)   # torchrun: each rank's "cuda" is its own GPU
     out_dir = Path(a.out)
@@ -562,13 +575,15 @@ def main():
     if world > 1: full_ft.shard(model)
     print(f"device={dev} world={world} trainable params={sum(p.numel() for p in model.trainable_parameters())/1e6:.1f}M", flush=True)
 
-    reqs = training_requests(a, tok, manifest, holdout)
+    reqs, rejected = training_requests(a, tok, manifest, holdout)
+    rejected = {"train": rejected}
     # the none-pair gate (none_pairs) and the ceiling's token shapes (plan_shapes)
     state_tokens = state_token_counts(tok, reqs) if a.none_pair_max_state is not None or a.pass_tokens_max else None
     suite_hash = digest(Path(a.suite) / "manifest.json") if manifest else None
     if not rank:
         write_json(out_dir / "training_config.json", {"args": vars(a), "suite_sha256": suite_hash, "base_revision": revision, "init_source": init_source,
                                                     "ordinal_objective": "ranked_probability_score", "holdout": holdout})
+        write_json(out_dir / "provenance.json", provenance.run_provenance(a, dev, world, revision, init_source, rejected, run_started))
     print(f"{len(reqs)} training requests (holdout={holdout}), questions by type "
           f"{dict(Counter(q['qtype'] for r in reqs for q in materialize(r)['questions']))}")
 
@@ -666,12 +681,13 @@ def main():
     meta.head, meta.extra = model.head.state_dict(), {"args": vars(a), "suite_sha256": suite_hash, "init_source": init_source}
     finish_checkpoint(a.out, meta, tok)
     write_json(out_dir / "training_metrics.json", {"wall_seconds": wall, "records_seen": round(seen),
-               "requested_records": a.epochs * len(reqs), "truncated_records": 0, "rejected_records": 0,
+               "requested_records": a.epochs * len(reqs), "truncated_records": 0, "rejected_records": sum(rejected["train"].values()), "rejected_by_reason": rejected,
                "optimizer_steps": step, "forward_tokens": round(tokens_seen), "step_seconds": step_seconds, "optimizer_seconds": optimizer_seconds, "resume_seconds": resume_seconds, "resume_write_seconds": writer.seconds if writer else [], "world_size": world,
                "backbone_save_seconds": round(backbone_seconds, 1), "snapshots": snapshots.written if snapshots else [],   # snapshots: this attempt's (each snapshot.json has its own)
                "grad_norm": grad_norm_summary(grad_norms),
                "weights": meta.weights, "peak_device_bytes": peak_mem, "device": dev, "dtype": a.dtype, "batch": a.batch,
                "peak_rss_bytes": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * (1 if sys.platform == "darwin" else 1024)})
+    write_json(out_dir / "provenance.json", provenance.run_provenance(a, dev, world, revision, init_source, rejected, run_started, provenance.now()))
     print("saved", a.out, flush=True)
 
 

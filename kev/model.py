@@ -145,10 +145,21 @@ def admit(model, tok, rec, truncate=False, max_state=None):
 def fits(rec, *tokenizers, max_state=MAX_STATE, max_branch=MAX_BRANCH, max_packed=MAX_PACKED):
     """True when the internal record encodes strictly (no truncation) within the training context under every tokenizer
     given (frozen suites are admitted against the tokenizers of all their pinned bases)."""
-    try:
-        return all(len(encode(tok, rec, max_state=max_state, max_branch=max_branch, strict=True)["ids"]) <= max_packed for tok in tokenizers)
-    except ValueError:
-        return False
+    return context_rejection(rec, *tokenizers, max_state=max_state, max_branch=max_branch, max_packed=max_packed) is None
+
+
+def context_rejection(rec, *tokenizers, max_state=MAX_STATE, max_branch=MAX_BRANCH, max_packed=MAX_PACKED):
+    """Why the internal record does not fit (see fits): "state", "branch" or "packed" for the limit it is over, "invalid"
+    when it does not encode at all; None when it fits."""
+    for tok in tokenizers:
+        try:
+            enc = encode(tok, rec, max_state=max_state, max_branch=max_branch, strict=True)
+        except ContextOverflow as e:
+            return "state" if e.state_tokens is not None else "branch"
+        except ValueError:
+            return "invalid"
+        if len(enc["ids"]) > max_packed: return "packed"
+    return None
 
 
 def branch_mask(seg, device, dtype=torch.float32):
