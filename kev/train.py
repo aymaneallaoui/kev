@@ -377,6 +377,33 @@ def batch_loss(model, a, batch, dev, anchors, anchor_sources, autocast):
     return loss, terms
 
 
+def validation(model, tok, a, reqs, dev, autocast):
+    """--val_data: the model's loss and accuracy on held-out records, as given (no augmentation, none pairs, permuted copy
+    or anchor), encoded and batched (--batch records per pass) as training does, with training's question_loss. `loss` is
+    training's logged loss (mean over records of their mean question loss); by_question groups the questions by id."""
+    limits = {k: v for k, v in training_context(a.max_state).items() if k != "max_packed"}
+    total, correct, by_q = 0.0, 0, {}
+    model.eval()
+    try:
+        with torch.no_grad():
+            for start in range(0, len(reqs), a.batch):
+                recs = [materialize(r) for r in reqs[start:start + a.batch]]
+                with autocast:
+                    logits_b = model.forward_batch([model.encode(tok, rec, strict=True, **limits) for rec in recs], a.shared_prefix)
+                for rec, logits in zip(recs, logits_b):
+                    losses = [float(question_loss(z.float(), q, dev, a.ord_w, a.label_smoothing, a.brier_w, a.focal_gamma)) for z, q in zip(logits, rec["questions"])]
+                    total += sum(losses) / len(losses)
+                    for z, q, loss in zip(logits, rec["questions"], losses):
+                        hit = int(z.argmax()) == q["label"]; correct += hit
+                        s = by_q.setdefault(q["qid"], {"loss": 0.0, "correct": 0, "n": 0})
+                        s["loss"] += loss; s["correct"] += hit; s["n"] += 1
+    finally:
+        model.train()
+    questions = sum(s["n"] for s in by_q.values())
+    return {"loss": total / len(reqs), "acc": correct / questions, "records": len(reqs), "questions": questions,
+            "by_question": {qid: {"loss": s["loss"] / s["n"], "acc": s["correct"] / s["n"], "n": s["n"]} for qid, s in sorted(by_q.items())}}
+
+
 # --- run --------------------------------------------------------------------------------------------------------------
 
 def parse_args():
@@ -422,6 +449,8 @@ def parse_args():
     ap.add_argument("--anchor_sources", default="", help="comma-separated sources to anchor (default: every record with a target)")
     ap.add_argument("--out", default="runs/kev")
     ap.add_argument("--data", default="", help="your own labelled requests, one JSON object per line (see kev.data.load_records); an alternative to --suite for fine-tuning, or combined with --suite and --replay")
+    ap.add_argument("--val_data", default="", help="held-out labelled requests (the --data format) scored after every epoch: loss and accuracy into training_metrics.json (val, best_epoch)")
+    ap.add_argument("--save_epochs", type=int, choices=[0, 1], default=0, help="also write a loadable checkpoint after every epoch into <out>/epoch-<N>")
     ap.add_argument("--max_state", type=int, default=MAX_STATE, help=f"state tokens per training record (default {MAX_STATE}); raising it admits long-state --data records, the packed limit grows by the same amount")
     ap.add_argument("--replay", type=int, default=0, help="with --data and --suite: mix in this many records sampled (by --seed) from the suite's training partition, so a delta fine-tune does not forget the released recipe")
     ap.add_argument("--init_from", default="", help="delta mode: warm-start LoRA and the pointer head from an existing run "
@@ -481,6 +510,8 @@ def parse_args():
                  "nor --anchor_w (a split record's parts would weight its anchored questions by their part's share of all its questions, "
                  "not 1 / anchored questions), nor under torchrun (FSDP2 ranks must run the same number of backward passes; sharded "
                  "ranks have the memory without it)")
+    if a.full_ft and (a.val_data or a.save_epochs):
+        ap.error("--val_data and --save_epochs are for LoRA runs (full-weight runs have --snapshot_fractions; a validation pass under FSDP2 is not implemented)")
     if (a.save_every_steps or a.save_every_minutes or a.resume or a.stop_after) and not a.full_ft:
         ap.error("resume points are for full-weight runs (--full_ft 1)")
     try: fractions = full_ft.snapshot_fractions(a.snapshot_fractions)
@@ -577,6 +608,10 @@ def main():
 
     reqs, rejected = training_requests(a, tok, manifest, holdout)
     rejected = {"train": rejected}
+    if a.val_data:
+        val_reqs, rejected["val"] = context_filter(load_records(a.val_data), tok, a.max_state)
+        if not val_reqs: raise ValueError(f"--val_data {a.val_data}: no record fits the training context ({rejected['val']})")
+        print(f"validation: {len(val_reqs)} records from {a.val_data} (rejected {rejected['val']})", flush=True)
     # the none-pair gate (none_pairs) and the ceiling's token shapes (plan_shapes)
     state_tokens = state_token_counts(tok, reqs) if a.none_pair_max_state is not None or a.pass_tokens_max else None
     suite_hash = digest(Path(a.suite) / "manifest.json") if manifest else None
@@ -602,6 +637,7 @@ def main():
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=[a.lr, a.head_lr or a.lr], total_steps=max(steps, 1), pct_start=0.1)
     step = seen = tokens_seen = peak_mem = optimizer_seconds = elapsed = start_epoch = start_mb = 0; step_seconds, resume_seconds = [], []; run = Counter()
     grad_norms = []   # per epoch, each optimizer step's global gradient norm before clipping
+    val = []
     resume_dir, resume_args = out_dir / "resume", {k: v for k, v in vars(a).items() if k not in RESUME_KNOBS}
     position = full_ft.load_resume(resume_dir, opt, sched, resume_args) if a.resume else None
     if position:
@@ -665,6 +701,16 @@ def main():
                     writer.save(step, opt, sched, {**dict(zip(RESUMED, values)), "run": dict(run), "world": world, "args": resume_args}, after=snapshots)
                     resume_seconds.append(round(time.time() - last, 3)); saved_at = last = time.time()   # the time training blocked, not part of the next step's
                 if step == a.stop_after: stopped = True; break
+        if (a.val_data or a.save_epochs) and not stopped and mb == len(plan) - 1:
+            if a.val_data:
+                val.append({"epoch": ep + 1, "step": step, **validation(model, tok, a, val_reqs, dev, autocast)})
+                print(f"ep{ep} val loss {val[-1]['loss']:.4f} acc {val[-1]['acc']:.4f} "
+                      + " ".join(f"{qid} {s['loss']:.3f}/{s['acc']:.3f}" for qid, s in val[-1]["by_question"].items()), flush=True)
+            if a.save_epochs:
+                epoch_dir = out_dir / f"epoch-{ep + 1}"
+                model.lm.save_pretrained(epoch_dir)
+                finish_checkpoint(epoch_dir, dataclasses.replace(meta, head=model.head.state_dict(), extra={"args": vars(a), "suite_sha256": suite_hash, "init_source": init_source, "epoch": ep + 1}), tok)
+            last = time.time()   # the time training blocked, not part of the next step's
         if step == steps or stopped: break
     if writer: writer.wait()   # a resume point being written in the background is finished (and then superseded, or continued from)
     if snapshots: snapshots.wait()   # and the last snapshot
@@ -685,6 +731,7 @@ def main():
                "optimizer_steps": step, "forward_tokens": round(tokens_seen), "step_seconds": step_seconds, "optimizer_seconds": optimizer_seconds, "resume_seconds": resume_seconds, "resume_write_seconds": writer.seconds if writer else [], "world_size": world,
                "backbone_save_seconds": round(backbone_seconds, 1), "snapshots": snapshots.written if snapshots else [],   # snapshots: this attempt's (each snapshot.json has its own)
                "grad_norm": grad_norm_summary(grad_norms),
+               **({"val": val, "best_epoch": min(val, key=lambda v: v["loss"])["epoch"]} if val else {}),
                "weights": meta.weights, "peak_device_bytes": peak_mem, "device": dev, "dtype": a.dtype, "batch": a.batch,
                "peak_rss_bytes": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * (1 if sys.platform == "darwin" else 1024)})
     write_json(out_dir / "provenance.json", provenance.run_provenance(a, dev, world, revision, init_source, rejected, run_started, provenance.now()))

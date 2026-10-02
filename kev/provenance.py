@@ -78,7 +78,7 @@ def run_provenance(a, dev, world, revision, init_source, rejected, started, ende
     """The provenance.json of one kev.train run. rejected: {"train": {reason: count}, "val": ...} from the context filter."""
     base_sha, unresolved = resolved_revision(a.base, revision)
     return {"kev": code_commit(),
-            "data": {"data": file_record(a.data)},
+            "data": {"data": file_record(a.data), "val_data": file_record(a.val_data)},
             "base": {"id": a.base, "requested_revision": revision, "revision": base_sha, "unresolved": unresolved},
             "init": init_record(init_source), "seed": a.seed, "versions": versions(), "device": device_record(dev, world),
             "rejected_records": rejected, "started": started, "ended": ended}

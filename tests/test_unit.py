@@ -1,6 +1,7 @@
 """Fast tests with no model weights and no server: API mapping, confidence formulas, mask rule, token sanitizing.
 Run: uv run --extra serve python -m pytest tests/test_unit.py -q
 """
+import contextlib
 import math
 import time
 from pathlib import Path
@@ -2557,12 +2558,12 @@ def test_run_provenance_hashes_data_and_records_rejections(tmp_path, monkeypatch
     from kev import provenance
     data = tmp_path / "train.jsonl"; data.write_text('{"x": 1}\n', encoding="utf-8")
     monkeypatch.setenv("KEV_GIT_COMMIT", "c" * 40)
-    a = SimpleNamespace(base=str(tmp_path), data=str(data), seed=7)
+    a = SimpleNamespace(base=str(tmp_path), data=str(data), val_data="", seed=7)
     init = {"init_from": "org/kev", "resolved": str(tmp_path / "snapshots" / ("d" * 40)), "weights_sha256": "w", "head_sha256": "h", "tensors": 2}
     p = provenance.run_provenance(a, "cpu", 1, None, init, {"train": {"state": 2}}, "t0", "t1")
     assert p["kev"] == {"commit": "c" * 40, "dirty": None}
     assert p["data"]["data"] == {"path": str(data.resolve()), "bytes": 9, "sha256": hashlib.sha256(b'{"x": 1}\n').hexdigest()}
-    assert p["data"] == {"data": p["data"]["data"]} and p["init"]["revision"] == "d" * 40 and p["init"]["weights_sha256"] == "w"
+    assert p["data"]["val_data"] is None and p["init"]["revision"] == "d" * 40 and p["init"]["weights_sha256"] == "w"
     assert p["base"]["revision"] is None and p["base"]["unresolved"] and p["seed"] == 7
     assert p["rejected_records"] == {"train": {"state": 2}} and (p["started"], p["ended"]) == ("t0", "t1")
     assert p["device"] == {"type": "cpu", "name": None, "world_size": 1} and set(p["versions"]) == {"python", "torch", "transformers", "peft"}
@@ -2571,3 +2572,33 @@ def test_run_provenance_hashes_data_and_records_rejections(tmp_path, monkeypatch
     assert commit["commit"] is None or (len(commit["commit"]) == 40 and isinstance(commit["dirty"], bool))
     assert provenance.code_commit(tmp_path) == {"commit": None, "dirty": None}
 
+
+def test_validation_scores_records_without_augmentation_and_restores_train_mode(tmp_path):
+    from kev.model import MAX_STATE
+    from kev.train import validation
+    reqs = _write_records(tmp_path / "v.jsonl", [
+        {"state": "s0", "questions": {"op": _choice("Pick.", "a"), "target": _choice("Which?", "b")}},
+        {"state": "s1", "questions": {"op": _choice("Pick.", "b")}},
+    ])
+    logits = {"s0": [torch.tensor([2.0, 0.0]), torch.tensor([2.0, 0.0])], "s1": [torch.tensor([0.0, 0.0])]}
+
+    class Model:
+        training, modes = True, []
+        def eval(self): self.training = False; self.modes.append("eval")
+        def train(self): self.training = True; self.modes.append("train")
+        def encode(self, tok, rec, strict, **limits):
+            assert strict and len(rec["questions"][0]["options"]) == 2   # no none option added
+            return rec["state"]
+        def forward_batch(self, encs, shared):
+            assert not self.training and not torch.is_grad_enabled()
+            return [logits[e] for e in encs]
+
+    model = Model()
+    a = SimpleNamespace(max_state=MAX_STATE, batch=2, shared_prefix=0, ord_w=0.0, label_smoothing=0.0, brier_w=0.0, focal_gamma=0.0)
+    out = validation(model, None, a, reqs, "cpu", contextlib.nullcontext())
+    right, wrong, even = (float(-torch.log_softmax(torch.tensor(z), 0)[0]) for z in ([2.0, 0.0], [0.0, 2.0], [0.0, 0.0]))
+    assert model.modes == ["eval", "train"] and model.training
+    assert out["records"] == 2 and out["questions"] == 3 and out["acc"] == pytest.approx(1 / 3)
+    assert out["loss"] == pytest.approx(((right + wrong) / 2 + even) / 2)
+    assert out["by_question"]["op"] == {"loss": pytest.approx((right + even) / 2), "acc": 0.5, "n": 2}
+    assert out["by_question"]["target"] == {"loss": pytest.approx(wrong), "acc": 0.0, "n": 1}
