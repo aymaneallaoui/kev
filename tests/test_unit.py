@@ -2618,3 +2618,17 @@ def test_validation_scores_records_without_augmentation_and_restores_train_mode(
     assert out["loss"] == pytest.approx(((right + wrong) / 2 + even) / 2)
     assert out["by_question"]["op"] == {"loss": pytest.approx((right + even) / 2), "acc": 0.5, "n": 2}
     assert out["by_question"]["target"] == {"loss": pytest.approx(wrong), "acc": 0.0, "n": 1}
+    assert "by_site" not in out and "loss_site_mean" not in out                         # the records carry no site
+
+    reqs[0]["_meta"]["site"], reqs[1]["_meta"]["site"] = "google.com", "github.com"
+    out = validation(model, None, a, reqs, "cpu", contextlib.nullcontext())
+    assert out["by_site"] == {"github.com": {"loss": pytest.approx(even), "acc": 0.0, "records": 1},
+                              "google.com": {"loss": pytest.approx((right + wrong) / 2), "acc": 0.5, "records": 1}}
+    assert out["loss_site_mean"] == pytest.approx(((right + wrong) / 2 + even) / 2)
+
+
+def test_best_epoch_weighs_sites_equally_when_validation_has_them():
+    from kev.train import best_epoch
+    val = [{"epoch": 1, "loss": 0.2, "loss_site_mean": 0.9}, {"epoch": 2, "loss": 0.3, "loss_site_mean": 0.5}]
+    assert best_epoch(val) == (2, "loss_site_mean")
+    assert best_epoch([{k: v for k, v in e.items() if k != "loss_site_mean"} for e in val]) == (1, "loss")

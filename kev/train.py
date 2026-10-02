@@ -380,9 +380,11 @@ def batch_loss(model, a, batch, dev, anchors, anchor_sources, autocast):
 def validation(model, tok, a, reqs, dev, autocast):
     """--val_data: the model's loss and accuracy on held-out records, as given (no augmentation, none pairs, permuted copy
     or anchor), encoded and batched (--batch records per pass) as training does, with training's question_loss. `loss` is
-    training's logged loss (mean over records of their mean question loss); by_question groups the questions by id."""
+    training's logged loss (mean over records of their mean question loss); by_question groups the questions by id. When
+    every record carries `_meta.site`, by_site groups them by site and loss_site_mean weighs each site equally."""
     limits = {k: v for k, v in training_context(a.max_state).items() if k != "max_packed"}
-    total, correct, by_q = 0.0, 0, {}
+    sites = [r["_meta"].get("site") for r in reqs]
+    total, correct, by_q, by_site = 0.0, 0, {}, {}
     model.eval()
     try:
         with torch.no_grad():
@@ -390,18 +392,31 @@ def validation(model, tok, a, reqs, dev, autocast):
                 recs = [materialize(r) for r in reqs[start:start + a.batch]]
                 with autocast:
                     logits_b = model.forward_batch([model.encode(tok, rec, strict=True, **limits) for rec in recs], a.shared_prefix)
-                for rec, logits in zip(recs, logits_b):
+                for rec, logits, site in zip(recs, logits_b, sites[start:start + a.batch]):
                     losses = [float(question_loss(z.float(), q, dev, a.ord_w, a.label_smoothing, a.brier_w, a.focal_gamma)) for z, q in zip(logits, rec["questions"])]
                     total += sum(losses) / len(losses)
-                    for z, q, loss in zip(logits, rec["questions"], losses):
-                        hit = int(z.argmax()) == q["label"]; correct += hit
+                    hits = [int(z.argmax()) == q["label"] for z, q in zip(logits, rec["questions"])]
+                    for q, loss, hit in zip(rec["questions"], losses, hits):
+                        correct += hit
                         s = by_q.setdefault(q["qid"], {"loss": 0.0, "correct": 0, "n": 0})
                         s["loss"] += loss; s["correct"] += hit; s["n"] += 1
+                    s = by_site.setdefault(site, {"loss": 0.0, "correct": 0, "questions": 0, "records": 0})
+                    s["loss"] += sum(losses) / len(losses); s["correct"] += sum(hits); s["questions"] += len(hits); s["records"] += 1
     finally:
         model.train()
     questions = sum(s["n"] for s in by_q.values())
-    return {"loss": total / len(reqs), "acc": correct / questions, "records": len(reqs), "questions": questions,
-            "by_question": {qid: {"loss": s["loss"] / s["n"], "acc": s["correct"] / s["n"], "n": s["n"]} for qid, s in sorted(by_q.items())}}
+    out = {"loss": total / len(reqs), "acc": correct / questions, "records": len(reqs), "questions": questions,
+           "by_question": {qid: {"loss": s["loss"] / s["n"], "acc": s["correct"] / s["n"], "n": s["n"]} for qid, s in sorted(by_q.items())}}
+    if None not in by_site:
+        out["by_site"] = {site: {"loss": s["loss"] / s["records"], "acc": s["correct"] / s["questions"], "records": s["records"]} for site, s in sorted(by_site.items())}
+        out["loss_site_mean"] = sum(s["loss"] for s in out["by_site"].values()) / len(by_site)
+    return out
+
+
+def best_epoch(val):
+    """(the epoch with the lowest validation loss, the loss it was chosen by): loss_site_mean when the records carry sites."""
+    key = "loss_site_mean" if "loss_site_mean" in val[0] else "loss"
+    return min(val, key=lambda v: v[key])["epoch"], key
 
 
 # --- run --------------------------------------------------------------------------------------------------------------
@@ -705,6 +720,7 @@ def main():
             if a.val_data:
                 val.append({"epoch": ep + 1, "step": step, **validation(model, tok, a, val_reqs, dev, autocast)})
                 print(f"ep{ep} val loss {val[-1]['loss']:.4f} acc {val[-1]['acc']:.4f} "
+                      + (f"site-mean loss {val[-1]['loss_site_mean']:.4f} " if "loss_site_mean" in val[-1] else "")
                       + " ".join(f"{qid} {s['loss']:.3f}/{s['acc']:.3f}" for qid, s in val[-1]["by_question"].items()), flush=True)
             if a.save_epochs:
                 epoch_dir = out_dir / f"epoch-{ep + 1}"
@@ -731,7 +747,7 @@ def main():
                "optimizer_steps": step, "forward_tokens": round(tokens_seen), "step_seconds": step_seconds, "optimizer_seconds": optimizer_seconds, "resume_seconds": resume_seconds, "resume_write_seconds": writer.seconds if writer else [], "world_size": world,
                "backbone_save_seconds": round(backbone_seconds, 1), "snapshots": snapshots.written if snapshots else [],   # snapshots: this attempt's (each snapshot.json has its own)
                "grad_norm": grad_norm_summary(grad_norms),
-               **({"val": val, "best_epoch": min(val, key=lambda v: v["loss"])["epoch"]} if val else {}),
+               **({"val": val, **dict(zip(("best_epoch", "best_epoch_criterion"), best_epoch(val)))} if val else {}),
                "weights": meta.weights, "peak_device_bytes": peak_mem, "device": dev, "dtype": a.dtype, "batch": a.batch,
                "peak_rss_bytes": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * (1 if sys.platform == "darwin" else 1024)})
     write_json(out_dir / "provenance.json", provenance.run_provenance(a, dev, world, revision, init_source, rejected, run_started, provenance.now()))
